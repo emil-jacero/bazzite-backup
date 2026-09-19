@@ -9,6 +9,9 @@
 #   password-dir  <password-dir>/<user>/<repo> holds the repository password
 #                 for <repo-root>/<user>/<repo>; repositories without one are skipped
 # env: KEEP_DAILY (14) KEEP_WEEKLY (8) KEEP_MONTHLY (12) CHECK_SUBSET (2%)
+#
+# Files this script creates are chowned back to the owner of <repo-root>
+# (the REST server's uid, 568 on TrueNAS) so the server can still read them.
 set -euo pipefail
 ROOT=${1:?repo-root}
 PWDIR=${2:?password-dir}
@@ -18,6 +21,7 @@ KEEP_WEEKLY=${KEEP_WEEKLY:-8}
 KEEP_MONTHLY=${KEEP_MONTHLY:-12}
 CHECK_SUBSET=${CHECK_SUBSET:-2%}
 export RESTIC_CACHE_DIR=${RESTIC_CACHE_DIR:-/root/.cache/restic}
+OWNER=$(stat -c %u:%g "$ROOT")
 rc=0
 
 for cfg in "$ROOT"/*/*/config; do
@@ -35,12 +39,14 @@ for cfg in "$ROOT"/*/*/config; do
     echo "   locked (a client is probably running), skipping"
     continue
   fi
+  # group by host and tags, not paths: adding a user or changing the bind path
+  # must not strand old snapshots in a group of their own that never expires
   if ! "$RESTIC" forget --keep-daily "$KEEP_DAILY" --keep-weekly "$KEEP_WEEKLY" \
-        --keep-monthly "$KEEP_MONTHLY" --group-by host,paths --prune; then
-    echo "   forget/prune FAILED"; rc=1; continue
-  fi
-  if ! "$RESTIC" check --read-data-subset="$CHECK_SUBSET"; then
+        --keep-monthly "$KEEP_MONTHLY" --group-by host,tags --prune; then
+    echo "   forget/prune FAILED"; rc=1
+  elif ! "$RESTIC" check --read-data-subset="$CHECK_SUBSET"; then
     echo "   check FAILED"; rc=1
   fi
+  chown -R "$OWNER" "$repo"
 done
 exit $rc

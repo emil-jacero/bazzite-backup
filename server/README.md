@@ -14,7 +14,19 @@ repository that has a password file at `<password-dir>/<user>/<repo>`:
 3. `restic check --read-data-subset=2%`.
 
 Repositories without a password file are listed and skipped, so adding a
-machine never silently enrols it into pruning.
+machine never silently enrols it into pruning. After each repository the script
+chowns it back to the owner of the repo root (uid 568 on TrueNAS), because
+files written by root would otherwise be unreadable for the REST server.
+
+## Deleting a specific snapshot
+
+Clients cannot delete. On the server, with the password file in place:
+
+```
+R=/mnt/data/backups/restic-server/<user>/<repo>
+restic -r $R -p /root/.config/bazzite-backup/passwords/<user>/<repo> forget <snapshot-id> --prune
+chown -R 568:568 $R
+```
 
 ## Setup on TrueNAS (25.10 or later)
 
