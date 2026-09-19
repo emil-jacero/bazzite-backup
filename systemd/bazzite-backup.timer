@@ -1,0 +1,15 @@
+[Unit]
+Description=bazzite-backup schedule (twice daily)
+Documentation=https://github.com/emil-jacero/bazzite-backup
+
+[Timer]
+# Override with: sudo systemctl edit bazzite-backup.timer
+#   [Timer]
+#   OnCalendar=
+#   OnCalendar=daily
+OnCalendar=*-*-* 00,12:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

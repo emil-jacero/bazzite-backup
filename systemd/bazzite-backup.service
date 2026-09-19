@@ -1,0 +1,16 @@
+[Unit]
+Description=bazzite-backup: restic backup of user homes
+Documentation=https://github.com/emil-jacero/bazzite-backup
+ConditionACPower=true
+Wants=network-online.target
+After=network-online.target
+OnFailure=bazzite-backup-notify.service
+
+[Service]
+Type=oneshot
+# Exit 1 here skips the run quietly (battery / backend down), it is not a failure.
+ExecCondition=/usr/local/bin/bazzite-backup reachable
+ExecStart=/usr/local/bin/bazzite-backup run
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

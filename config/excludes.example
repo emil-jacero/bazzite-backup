@@ -1,0 +1,24 @@
+# /etc/bazzite-backup/excludes - one restic exclude pattern per line.
+# A leading "~/" is expanded to every backed-up user's home. Other lines are
+# passed to restic unchanged. Directories with a CACHEDIR.TAG are skipped anyway.
+
+# caches and regenerable state
+~/.cache
+~/.local/share/Trash
+~/.local/share/containers
+~/.npm/_cacache
+~/go/pkg
+~/.var/app/*/cache
+~/.var/app/*/.cache
+
+# game files that the launcher re-downloads (saves and configs stay included)
+~/.local/share/Steam/steamapps/common
+~/.local/share/Steam/steamapps/shadercache
+~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common
+~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/shadercache
+~/Games/*/prefix/drive_c/users/*/AppData/Local/Temp
+
+# build output inside projects
+~/**/node_modules
+~/**/target/debug
+~/**/target/release

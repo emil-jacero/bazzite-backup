@@ -1,0 +1,458 @@
+#!/usr/bin/bash
+# bazzite-backup - restic backups of user homes on Fedora Atomic / Bazzite.
+# Snapshots the home subvolume with snapper, bind-mounts it read-only at a
+# stable path, and backs it up (plus extra paths) to a restic REST server or S3.
+# https://github.com/emil-jacero/bazzite-backup
+set -euo pipefail
+
+VERSION=0.1.0
+NAME=bazzite-backup
+CONF_DIR=/etc/$NAME
+CONF=$CONF_DIR/config
+SECRETS=$CONF_DIR/secrets
+PW_FILE=$CONF_DIR/repo-password
+EXCLUDES=$CONF_DIR/excludes
+SHARE=/usr/local/share/$NAME
+STATE=/var/lib/$NAME
+CACHE=/var/cache/$NAME
+BIND=/run/$NAME/home
+
+usage() {
+  cat <<USAGE
+$NAME $VERSION - restic backups of user homes on Bazzite / Fedora Atomic
+
+usage: $NAME <command> [options]
+
+  init [options]     configure, initialise the repository, enable the timer
+  run                perform a backup now (what the timer runs)
+  restic <args...>   run restic against the configured repository
+  status             timer, last result, latest snapshots
+  reachable          exit 0 if the backend answers (used by ExecCondition)
+  notify             failure hook (used by OnFailure)
+  version
+
+init options (anything missing is prompted for unless --yes is given):
+  --backend rest|s3          which backend to configure
+  --repo URL                 full restic repository URL (overrides the builders below)
+  --rest-url URL             REST server base URL, e.g. http://10.0.0.2:30248
+  --rest-user U --rest-pass P
+  --s3-endpoint URL --s3-bucket B --s3-key K --s3-secret S [--s3-region R]
+  --repo-name NAME           path under the user/bucket, default: hostname
+  --repo-password P          repository password (or --repo-password-file F)
+  --users "a b"              users to back up, default: auto (all homes)
+  --extra-paths "/etc ..."   extra roots, default: /etc
+  --ping-url URL             healthchecks.io or ntfy URL for success/failure pings
+  --no-desktop-notify        do not pop a desktop notification on failure
+  --yes                      non-interactive: fail instead of prompting
+  --run-now                  run the first backup after init
+
+Secrets can also come from the environment: BB_REST_PASSWORD, BB_S3_SECRET,
+BB_REPO_PASSWORD.
+USAGE
+}
+
+log()  { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
+die()  { echo "error: $*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "run as root: sudo $NAME $*"; }
+
+# ---------------------------------------------------------------- config ----
+load_config() {
+  [[ -r $CONF ]] || die "no config at $CONF - run: sudo $NAME init"
+  set -a
+  HOME_ROOT=/var/home
+  BACKUP_USERS=auto
+  EXTRA_PATHS=/etc
+  SNAPPER_CONFIG=auto
+  REACHABILITY_URL=""
+  PING_URL=""
+  PING_KIND=auto
+  NOTIFY_DESKTOP=true
+  BACKUP_TAG=$NAME
+  # shellcheck disable=SC1090
+  source "$CONF"
+  # shellcheck disable=SC1090
+  [[ -r $SECRETS ]] && source "$SECRETS"
+  # shellcheck disable=SC2034  # exported via set -a
+  RESTIC_PASSWORD_FILE=$PW_FILE
+  # shellcheck disable=SC2034
+  RESTIC_CACHE_DIR=$CACHE
+  set +a
+  [[ -n ${RESTIC_REPOSITORY:-} ]] || die "RESTIC_REPOSITORY is not set in $CONF"
+  [[ -n $REACHABILITY_URL ]] || REACHABILITY_URL=$(derive_reach_url "$RESTIC_REPOSITORY")
+}
+
+# scheme://host[:port]/ of a rest: or s3: repository URL; empty for others
+derive_reach_url() {
+  local u
+  case $1 in
+    rest:*) u=${1#rest:} ;;
+    s3:*)   u=${1#s3:}; [[ $u == *://* ]] || u="https://$u" ;;
+    *)      return 0 ;;
+  esac
+  sed -E 's#^([a-z]+://[^/]+).*#\1/#' <<<"$u"
+}
+
+resolve_users() {
+  USERS=()
+  if [[ $BACKUP_USERS == auto ]]; then
+    local d uid
+    for d in "$HOME_ROOT"/*/; do
+      d=${d%/}
+      [[ -d $d ]] || continue
+      uid=$(stat -c %u "$d")
+      (( uid >= 1000 )) || continue
+      USERS+=("${d##*/}")
+    done
+  else
+    read -ra USERS <<<"$BACKUP_USERS"
+  fi
+  (( ${#USERS[@]} )) || die "no users to back up under $HOME_ROOT"
+}
+
+# name of the snapper config whose SUBVOLUME is HOME_ROOT, if any
+find_snapper_config() {
+  local c sub
+  for c in /etc/snapper/configs/*; do
+    [[ -f $c ]] || continue
+    sub=$(sed -n 's/^SUBVOLUME="\(.*\)"/\1/p' "$c")
+    [[ $sub == "$HOME_ROOT" ]] && { basename "$c"; return 0; }
+  done
+  return 1
+}
+
+# ------------------------------------------------------------- manifests ----
+write_manifests() {
+  local u dir
+  for u in "${USERS[@]}"; do
+    dir=$HOME_ROOT/$u/.local/state/$NAME
+    install -d -o "$u" -g "$u" "$dir"
+    rpm-ostree status --json                                 > "$dir/rpm-ostree-status.json" 2>/dev/null || true
+    flatpak list --app --columns=application,origin,branch  > "$dir/flatpaks-system.tsv"    2>/dev/null || true
+    runuser -u "$u" -- flatpak list --user --app --columns=application,origin,branch \
+                                                             > "$dir/flatpaks-user.tsv"      2>/dev/null || true
+    ostree admin config-diff                                 > "$dir/etc-config-diff.txt"    2>/dev/null || true
+    systemctl list-unit-files --state=enabled --no-legend   > "$dir/enabled-units.txt"      2>/dev/null || true
+    if [[ -x /home/linuxbrew/.linuxbrew/bin/brew ]]; then
+      runuser -u "$u" -- env HOME="$HOME_ROOT/$u" /home/linuxbrew/.linuxbrew/bin/brew \
+        bundle dump --force --file="$dir/Brewfile" >/dev/null 2>&1 || true
+    fi
+    chown -R "$u:$u" "$dir"
+  done
+}
+
+# expand ~/ patterns for every user; always skip the snapper dir
+expand_excludes() {
+  local line u
+  echo "$BIND/.snapshots"
+  [[ -r $EXCLUDES ]] || return 0
+  while IFS= read -r line; do
+    line=${line%%#*}; line=${line%"${line##*[![:space:]]}"}
+    [[ -n $line ]] || continue
+    # shellcheck disable=SC2088  # literal tilde prefix is the exclude-file syntax
+    if [[ $line == "~/"* ]]; then
+      for u in "${USERS[@]}"; do echo "$BIND/$u/${line#\~/}"; done
+    else
+      echo "$line"
+    fi
+  done < "$EXCLUDES"
+}
+
+# ----------------------------------------------------------------- ping ----
+ping_url() { # ok | fail
+  [[ -n $PING_URL ]] || return 0
+  local kind=$PING_KIND
+  [[ $kind == auto ]] && { [[ $PING_URL == *ntfy* ]] && kind=ntfy || kind=healthchecks; }
+  if [[ $kind == ntfy ]]; then
+    local prio=low tag=white_check_mark
+    [[ $1 == fail ]] && { prio=high; tag=x; }
+    curl -s -m 10 -o /dev/null -H "Title: $NAME on $(hostname)" -H "Priority: $prio" -H "Tags: $tag" \
+      -d "backup $1 on $(hostname)" "$PING_URL" || true
+  else
+    curl -s -m 10 -o /dev/null "$PING_URL$([[ $1 == fail ]] && echo /fail)" || true
+  fi
+}
+
+# ------------------------------------------------------------------ run ----
+cmd_run() {
+  need_root run
+  load_config
+  resolve_users
+  mkdir -p "$STATE" "$CACHE" "$BIND"
+
+  log "writing manifests for: ${USERS[*]}"
+  write_manifests
+
+  local cfg="" num="" src="" tmp_excl=""
+  if [[ $SNAPPER_CONFIG != none ]]; then
+    cfg=$SNAPPER_CONFIG
+    [[ $cfg == auto ]] && { cfg=$(find_snapper_config) || cfg=""; }
+    if [[ -n $cfg ]]; then
+      num=$(snapper -c "$cfg" create --type single --cleanup-algorithm number \
+              --description "$NAME" --print-number)
+      src=$HOME_ROOT/.snapshots/$num/snapshot
+      log "snapper snapshot $num of $HOME_ROOT (config $cfg)"
+    else
+      log "no snapper config covers $HOME_ROOT - backing up the live tree"
+    fi
+  fi
+  [[ -n $src ]] || src=$HOME_ROOT
+
+  cleanup() {
+    mountpoint -q "$BIND" && umount "$BIND"
+    [[ -n $num ]] && snapper -c "$cfg" delete "$num" 2>/dev/null || true
+    [[ -n $tmp_excl ]] && rm -f "$tmp_excl"
+    return 0
+  }
+  trap cleanup EXIT
+  mount --bind -o ro "$src" "$BIND"
+
+  local paths=() u extra=()
+  for u in "${USERS[@]}"; do
+    [[ -d $BIND/$u ]] || die "$HOME_ROOT/$u does not exist in the snapshot"
+    paths+=("$BIND/$u")
+  done
+  read -ra extra <<<"$EXTRA_PATHS"
+  paths+=("${extra[@]}")
+
+  tmp_excl=$(mktemp)
+  expand_excludes > "$tmp_excl"
+
+  log "restic backup -> $RESTIC_REPOSITORY"
+  if restic backup --exclude-file="$tmp_excl" --exclude-caches --tag "$BACKUP_TAG" "${paths[@]}"; then
+    date -Is > "$STATE/last-success"
+    rm -f "$STATE/last-failure"
+    ping_url ok
+    log "backup done"
+  else
+    die "restic backup failed"
+  fi
+}
+
+# ------------------------------------------------------------- reachable ----
+cmd_reachable() {
+  load_config
+  [[ -n $REACHABILITY_URL ]] || exit 0
+  curl -s -o /dev/null --max-time 10 "$REACHABILITY_URL"
+}
+
+# ---------------------------------------------------------------- notify ----
+cmd_notify() {
+  need_root notify
+  load_config
+  mkdir -p "$STATE"
+  date -Is > "$STATE/last-failure"
+  ping_url fail
+  [[ $NOTIFY_DESKTOP == true ]] || exit 0
+  local uid user seen=" "
+  while read -r _ uid user _; do
+    (( uid >= 1000 )) || continue
+    [[ $seen == *" $uid "* ]] && continue
+    seen+="$uid "
+    [[ -S /run/user/$uid/bus ]] || continue
+    runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+      XDG_RUNTIME_DIR="/run/user/$uid" notify-send -a "$NAME" -u critical \
+      "Backup failed on $(hostname)" "Run: journalctl -u $NAME" >/dev/null 2>&1 || true
+  done < <(loginctl list-sessions --no-legend 2>/dev/null)
+}
+
+# ---------------------------------------------------------------- status ----
+cmd_status() {
+  need_root status
+  load_config
+  echo "repository:   $RESTIC_REPOSITORY"
+  echo "last success: $(cat "$STATE/last-success" 2>/dev/null || echo never)"
+  [[ -f $STATE/last-failure ]] && echo "last failure: $(cat "$STATE/last-failure")"
+  systemctl list-timers "$NAME.timer" --no-pager --no-legend | awk '{print "next run:     " $1, $2, $3, $4}'
+  echo
+  restic snapshots --latest 3 --compact
+}
+
+# ------------------------------------------------------------------ init ----
+ask() { # var prompt [default] [secret]
+  local var=$1 prompt=$2 def=${3:-} secret=${4:-} val
+  if [[ -n ${!var:-} ]]; then return 0; fi
+  [[ $YES == true ]] && die "--yes given but $var is missing (see $NAME --help)"
+  if [[ $secret == secret ]]; then
+    read -rsp "$prompt: " val; echo
+  else
+    read -rp "$prompt${def:+ [$def]}: " val
+    [[ -n $val ]] || val=$def
+  fi
+  printf -v "$var" '%s' "$val"
+}
+
+cmd_init() {
+  need_root init
+  local BACKEND="" REPO="" REST_URL="" REST_USER="" REST_PASS="${BB_REST_PASSWORD:-}"
+  local S3_ENDPOINT="" S3_BUCKET="" S3_KEY="" S3_SECRET="${BB_S3_SECRET:-}" S3_REGION=""
+  local REPO_NAME="" REPO_PASSWORD="${BB_REPO_PASSWORD:-}" REPO_PASSWORD_FILE=""
+  local USERS_OPT="" EXTRA="" PING="" DESKTOP=true YES=false RUN_NOW=false
+  while (( $# )); do
+    case $1 in
+      --backend)        BACKEND=$2; shift ;;
+      --repo)           REPO=$2; shift ;;
+      --rest-url)       REST_URL=$2; shift ;;
+      --rest-user)      REST_USER=$2; shift ;;
+      --rest-pass)      REST_PASS=$2; shift ;;
+      --s3-endpoint)    S3_ENDPOINT=$2; shift ;;
+      --s3-bucket)      S3_BUCKET=$2; shift ;;
+      --s3-key)         S3_KEY=$2; shift ;;
+      --s3-secret)      S3_SECRET=$2; shift ;;
+      --s3-region)      S3_REGION=$2; shift ;;
+      --repo-name)      REPO_NAME=$2; shift ;;
+      --repo-password)  REPO_PASSWORD=$2; shift ;;
+      --repo-password-file) REPO_PASSWORD_FILE=$2; shift ;;
+      --users)          USERS_OPT=$2; shift ;;
+      --extra-paths)    EXTRA=$2; shift ;;
+      --ping-url)       PING=$2; shift ;;
+      --no-desktop-notify) DESKTOP=false ;;
+      --yes)            YES=true ;;
+      --run-now)        RUN_NOW=true ;;
+      -h|--help)        usage; exit 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  # defaults from an existing config, so re-running init only asks for changes
+  if [[ -r $CONF ]]; then
+    # shellcheck disable=SC1090
+    local prev
+    # shellcheck disable=SC1090
+    prev=$(source "$CONF" 2>/dev/null; printf '%s\n' "${BACKEND:-}" "${RESTIC_REPOSITORY:-}" "${BACKUP_USERS:-}" "${EXTRA_PATHS:-}" "${PING_URL:-}")
+    { read -r pb; read -r pr; read -r pu; read -r pe; read -r pp; } <<<"$prev"
+    [[ -n $BACKEND ]]   || BACKEND=$pb
+    [[ -n $REPO ]]      || REPO=$pr
+    [[ -n $USERS_OPT ]] || USERS_OPT=$pu
+    [[ -n $EXTRA ]]     || EXTRA=$pe
+    [[ -n $PING ]]      || PING=$pp
+    echo "existing config found at $CONF - values shown as defaults"
+  fi
+
+  [[ $YES == true || -t 0 ]] || die "stdin is not a terminal; use --yes with options"
+  [[ -n $BACKEND ]] || { echo "backend: rest = restic REST server, s3 = S3-compatible object storage"; ask BACKEND "backend (rest/s3)" rest; }
+  [[ $BACKEND == rest || $BACKEND == s3 ]] || die "backend must be rest or s3"
+  ask REPO_NAME "repository name (path under your user/bucket)" "$(hostname)"
+
+  local secrets_body
+  case $BACKEND in
+    rest)
+      if [[ -z $REPO ]]; then
+        ask REST_URL "REST server base URL (e.g. http://10.0.0.2:30248)"
+        ask REST_USER "REST server username"
+        REPO="rest:${REST_URL%/}/$REST_USER/$REPO_NAME"
+      else
+        ask REST_USER "REST server username"
+      fi
+      ask REST_PASS "REST server password" "" secret
+      secrets_body=$(printf 'RESTIC_REST_USERNAME=%q\nRESTIC_REST_PASSWORD=%q\n' "$REST_USER" "$REST_PASS")
+      ;;
+    s3)
+      if [[ -z $REPO ]]; then
+        ask S3_ENDPOINT "S3 endpoint URL (e.g. https://s3.example.com)"
+        ask S3_BUCKET "bucket"
+        REPO="s3:${S3_ENDPOINT%/}/$S3_BUCKET/$REPO_NAME"
+      fi
+      ask S3_KEY "S3 access key id"
+      ask S3_SECRET "S3 secret access key" "" secret
+      secrets_body=$(printf 'AWS_ACCESS_KEY_ID=%q\nAWS_SECRET_ACCESS_KEY=%q\n' "$S3_KEY" "$S3_SECRET")
+      [[ -n $S3_REGION ]] && secrets_body+=$(printf '\nAWS_DEFAULT_REGION=%q' "$S3_REGION")
+      ;;
+  esac
+
+  if [[ -n $REPO_PASSWORD_FILE ]]; then
+    REPO_PASSWORD=$(<"$REPO_PASSWORD_FILE")
+  elif [[ -z $REPO_PASSWORD && -s $PW_FILE ]]; then
+    REPO_PASSWORD=$(<"$PW_FILE")
+    echo "keeping existing repository password from $PW_FILE"
+  fi
+  if [[ -z $REPO_PASSWORD ]]; then
+    echo "The repository password encrypts every backup. Store it in a password manager."
+    echo "Without it the backups cannot be read. Use the SAME password when reinstalling."
+    ask REPO_PASSWORD "new repository password" "" secret
+    local again=""; ask again "repeat repository password" "" secret
+    [[ $REPO_PASSWORD == "$again" ]] || die "passwords differ"
+  fi
+  (( ${#REPO_PASSWORD} >= 12 )) || die "repository password must be at least 12 characters"
+
+  [[ -n $USERS_OPT ]] || USERS_OPT=auto
+  [[ -n $EXTRA ]]     || EXTRA=/etc
+
+  # ---- write config ----
+  install -d -m 0755 "$CONF_DIR"
+  install -d -m 0700 "$STATE" "$CACHE"
+  umask 077
+  cat > "$CONF" <<CFG
+# $NAME configuration - see $SHARE/config.example for every key
+BACKEND=$BACKEND
+RESTIC_REPOSITORY=$REPO
+HOME_ROOT=/var/home
+BACKUP_USERS="$USERS_OPT"
+EXTRA_PATHS="$EXTRA"
+SNAPPER_CONFIG=auto
+PING_URL=$PING
+NOTIFY_DESKTOP=$DESKTOP
+CFG
+  printf '%s\n' "$secrets_body" > "$SECRETS"
+  printf '%s\n' "$REPO_PASSWORD" > "$PW_FILE"
+  umask 022
+  chmod 0644 "$CONF"
+  [[ -f $EXCLUDES ]] || install -m 0644 "$SHARE/excludes.example" "$EXCLUDES"
+  log "wrote $CONF, $SECRETS, $PW_FILE"
+
+  # ---- snapper ----
+  load_config
+  resolve_users
+  if [[ $(stat -f -c %T "$HOME_ROOT") == btrfs ]]; then
+    if find_snapper_config >/dev/null; then
+      log "snapper config '$(find_snapper_config)' already covers $HOME_ROOT"
+    else
+      # Bazzite's own 'ujust configure-snapshots' creates a config named root for /var/home.
+      snapper -c root create-config "$HOME_ROOT"
+      snapper -c root set-config NUMBER_LIMIT=0 NUMBER_LIMIT_IMPORTANT=0 NUMBER_MIN_AGE=1800 \
+        TIMELINE_CREATE=no TIMELINE_LIMIT_HOURLY=0 TIMELINE_LIMIT_DAILY=0 TIMELINE_LIMIT_WEEKLY=0 \
+        TIMELINE_LIMIT_MONTHLY=0 TIMELINE_LIMIT_YEARLY=0
+      systemctl enable --now snapper-cleanup.timer >/dev/null 2>&1 || true
+      log "created snapper config 'root' for $HOME_ROOT (timeline off; enable it in btrfs-assistant if wanted)"
+    fi
+  else
+    sed -i 's/^SNAPPER_CONFIG=.*/SNAPPER_CONFIG=none/' "$CONF"
+    log "$HOME_ROOT is not btrfs - backups will read the live tree"
+  fi
+
+  # ---- repository ----
+  if [[ -n $REACHABILITY_URL ]]; then
+    curl -s -o /dev/null --max-time 10 "$REACHABILITY_URL" || die "backend not reachable at $REACHABILITY_URL"
+  fi
+  if restic cat config >/dev/null 2>&1; then
+    log "repository already initialised: $RESTIC_REPOSITORY"
+  else
+    log "initialising repository $RESTIC_REPOSITORY"
+    restic init
+  fi
+
+  if systemctl daemon-reload 2>/dev/null && systemctl enable --now "$NAME.timer" >/dev/null 2>&1; then
+    log "timer enabled: $(systemctl list-timers "$NAME.timer" --no-pager --no-legend | awk '{print $1, $2, $3}')"
+  else
+    log "warning: could not enable $NAME.timer (no systemd?) - enable it manually"
+  fi
+  echo
+  echo "users:   ${USERS[*]}"
+  echo "extras:  $EXTRA_PATHS"
+  echo "next:    sudo $NAME run   (first backup)   |   sudo $NAME status"
+  [[ $RUN_NOW == true ]] && cmd_run
+  return 0
+}
+
+# ------------------------------------------------------------------ main ----
+case ${1:-} in
+  init)      shift; cmd_init "$@" ;;
+  run)       cmd_run ;;
+  restic)    shift; need_root restic; load_config; exec restic "$@" ;;
+  status)    cmd_status ;;
+  reachable) cmd_reachable ;;
+  notify)    cmd_notify ;;
+  version)   echo "$NAME $VERSION" ;;
+  -h|--help|help|"") usage ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac

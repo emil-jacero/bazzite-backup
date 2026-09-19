@@ -1,0 +1,41 @@
+# /etc/bazzite-backup/config - sourced by bash, non-secret settings.
+# Credentials live in /etc/bazzite-backup/secrets (mode 0600).
+
+# Backend type, informational: rest or s3.
+BACKEND=rest
+
+# restic repository URL. Any restic backend works; init builds these two forms:
+#   rest:http://10.0.0.2:30248/<rest-user>/<hostname>
+#   s3:https://s3.example.com/<bucket>/<hostname>
+RESTIC_REPOSITORY=rest:http://10.0.0.2:30248/alice/laptop
+
+# Where user homes live. /var/home on Fedora Atomic and Bazzite.
+HOME_ROOT=/var/home
+
+# Users to back up. "auto" = every directory in HOME_ROOT owned by a uid >= 1000.
+BACKUP_USERS="auto"
+
+# Extra roots backed up as-is (not from the snapshot). /etc holds your system changes.
+# Add /var/lib/libvirt for VM images, /var/lib/containers for root podman storage.
+EXTRA_PATHS="/etc"
+
+# snapper config that covers HOME_ROOT. auto = detect (init creates one named
+# "root", which is what Bazzite's 'ujust configure-snapshots' also uses).
+# none = skip snapshots and read the live tree.
+SNAPPER_CONFIG=auto
+
+# URL that must answer (any HTTP status) before a backup starts. Derived from
+# RESTIC_REPOSITORY when empty. Set to a non-URL like "skip" to disable the check.
+REACHABILITY_URL=
+
+# Optional monitoring. healthchecks.io: the check URL; failure hits <url>/fail.
+# ntfy: the topic URL; success posts low priority, failure high. PING_KIND=auto
+# picks ntfy when the URL contains "ntfy", else healthchecks.
+PING_URL=
+PING_KIND=auto
+
+# Pop a desktop notification for logged-in users when a backup fails.
+NOTIFY_DESKTOP=true
+
+# Tag applied to every snapshot.
+BACKUP_TAG=bazzite-backup

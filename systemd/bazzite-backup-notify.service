@@ -1,0 +1,7 @@
+[Unit]
+Description=bazzite-backup failure notification
+Documentation=https://github.com/emil-jacero/bazzite-backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bazzite-backup notify

@@ -1,0 +1,15 @@
+name: lint
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+      - run: shellcheck -x bin/bazzite-backup install.sh uninstall.sh server/truenas-maintenance.sh
+      - run: bash -n bin/bazzite-backup install.sh uninstall.sh server/truenas-maintenance.sh
+      - name: systemd-analyze verify
+        run: |
+          sudo install -m 0755 bin/bazzite-backup /usr/local/bin/bazzite-backup
+          sudo cp systemd/* /etc/systemd/system/
+          systemd-analyze verify /etc/systemd/system/bazzite-backup.service /etc/systemd/system/bazzite-backup.timer /etc/systemd/system/bazzite-backup-notify.service
