@@ -8,7 +8,7 @@ rm -f /etc/systemd/system/$NAME.service /etc/systemd/system/$NAME.timer /etc/sys
 rm -rf /etc/systemd/system/$NAME.timer.d /etc/systemd/system/$NAME.service.d
 rm -f /usr/local/bin/$NAME
 rm -rf /usr/local/share/$NAME /var/cache/$NAME
-systemctl daemon-reload
+systemctl daemon-reload 2>/dev/null || true
 if [[ ${1:-} == --purge ]]; then
   rm -rf "/etc/${NAME:?}" "/var/lib/${NAME:?}"
   echo "removed $NAME including config and repository password"

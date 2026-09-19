@@ -95,14 +95,14 @@ derive_reach_url() {
 resolve_users() {
   USERS=()
   if [[ $BACKUP_USERS == auto ]]; then
-    local d uid
-    for d in "$HOME_ROOT"/*/; do
-      d=${d%/}
-      [[ -d $d ]] || continue
-      uid=$(stat -c %u "$d")
-      (( uid >= 1000 )) || continue
-      USERS+=("${d##*/}")
-    done
+    # every real account (uid >= 1000) whose home is directly under HOME_ROOT
+    local u uid home
+    while IFS=: read -r u _ uid _ _ home _; do
+      (( uid >= 1000 && uid < 60000 )) || continue
+      # passwd says /home/u while the directory is /var/home/u on Atomic: compare resolved paths
+      [[ -d $home && $(realpath -m "$home") == "$(realpath -m "$HOME_ROOT/$u")" ]] || continue
+      USERS+=("$u")
+    done < <(getent passwd)
   else
     read -ra USERS <<<"$BACKUP_USERS"
   fi
@@ -165,8 +165,8 @@ ping_url() { # ok | fail
   if [[ $kind == ntfy ]]; then
     local prio=low tag=white_check_mark
     [[ $1 == fail ]] && { prio=high; tag=x; }
-    curl -s -m 10 -o /dev/null -H "Title: $NAME on $(hostname)" -H "Priority: $prio" -H "Tags: $tag" \
-      -d "backup $1 on $(hostname)" "$PING_URL" || true
+    curl -s -m 10 -o /dev/null -H "Title: $NAME on $(uname -n)" -H "Priority: $prio" -H "Tags: $tag" \
+      -d "backup $1 on $(uname -n)" "$PING_URL" || true
   else
     curl -s -m 10 -o /dev/null "$PING_URL$([[ $1 == fail ]] && echo /fail)" || true
   fi
@@ -182,29 +182,30 @@ cmd_run() {
   log "writing manifests for: ${USERS[*]}"
   write_manifests
 
-  local cfg="" num="" src="" tmp_excl=""
+  # globals: cleanup() runs from the EXIT trap after this function has returned
+  SNAP_CFG="" SNAP_NUM="" SNAP_SRC="" TMP_EXCL=""
   if [[ $SNAPPER_CONFIG != none ]]; then
-    cfg=$SNAPPER_CONFIG
-    [[ $cfg == auto ]] && { cfg=$(find_snapper_config) || cfg=""; }
-    if [[ -n $cfg ]]; then
-      num=$(snapper -c "$cfg" create --type single --cleanup-algorithm number \
+    SNAP_CFG=$SNAPPER_CONFIG
+    [[ $SNAP_CFG == auto ]] && { SNAP_CFG=$(find_snapper_config) || SNAP_CFG=""; }
+    if [[ -n $SNAP_CFG ]]; then
+      SNAP_NUM=$(snapper -c "$SNAP_CFG" create --type single --cleanup-algorithm number \
               --description "$NAME" --print-number)
-      src=$HOME_ROOT/.snapshots/$num/snapshot
-      log "snapper snapshot $num of $HOME_ROOT (config $cfg)"
+      SNAP_SRC=$HOME_ROOT/.snapshots/$SNAP_NUM/snapshot
+      log "snapper snapshot $SNAP_NUM of $HOME_ROOT (config $SNAP_CFG)"
     else
       log "no snapper config covers $HOME_ROOT - backing up the live tree"
     fi
   fi
-  [[ -n $src ]] || src=$HOME_ROOT
+  [[ -n $SNAP_SRC ]] || SNAP_SRC=$HOME_ROOT
 
   cleanup() {
     mountpoint -q "$BIND" && umount "$BIND"
-    [[ -n $num ]] && snapper -c "$cfg" delete "$num" 2>/dev/null || true
-    [[ -n $tmp_excl ]] && rm -f "$tmp_excl"
+    [[ -n $SNAP_NUM ]] && snapper -c "$SNAP_CFG" delete "$SNAP_NUM" 2>/dev/null || true
+    [[ -n $TMP_EXCL ]] && rm -f "$TMP_EXCL"
     return 0
   }
   trap cleanup EXIT
-  mount --bind -o ro "$src" "$BIND"
+  mount --bind -o ro "$SNAP_SRC" "$BIND"
 
   local paths=() u extra=()
   for u in "${USERS[@]}"; do
@@ -214,11 +215,11 @@ cmd_run() {
   read -ra extra <<<"$EXTRA_PATHS"
   paths+=("${extra[@]}")
 
-  tmp_excl=$(mktemp)
-  expand_excludes > "$tmp_excl"
+  TMP_EXCL=$(mktemp)
+  expand_excludes > "$TMP_EXCL"
 
   log "restic backup -> $RESTIC_REPOSITORY"
-  if restic backup --exclude-file="$tmp_excl" --exclude-caches --tag "$BACKUP_TAG" "${paths[@]}"; then
+  if restic backup --exclude-file="$TMP_EXCL" --exclude-caches --tag "$BACKUP_TAG" "${paths[@]}"; then
     date -Is > "$STATE/last-success"
     rm -f "$STATE/last-failure"
     ping_url ok
@@ -251,7 +252,7 @@ cmd_notify() {
     [[ -S /run/user/$uid/bus ]] || continue
     runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
       XDG_RUNTIME_DIR="/run/user/$uid" notify-send -a "$NAME" -u critical \
-      "Backup failed on $(hostname)" "Run: journalctl -u $NAME" >/dev/null 2>&1 || true
+      "Backup failed on $(uname -n)" "Run: journalctl -u $NAME" >/dev/null 2>&1 || true
   done < <(loginctl list-sessions --no-legend 2>/dev/null)
 }
 
@@ -262,7 +263,7 @@ cmd_status() {
   echo "repository:   $RESTIC_REPOSITORY"
   echo "last success: $(cat "$STATE/last-success" 2>/dev/null || echo never)"
   [[ -f $STATE/last-failure ]] && echo "last failure: $(cat "$STATE/last-failure")"
-  systemctl list-timers "$NAME.timer" --no-pager --no-legend | awk '{print "next run:     " $1, $2, $3, $4}'
+  systemctl list-timers "$NAME.timer" --no-pager --no-legend 2>/dev/null | awk '{print "next run:     " $1, $2, $3, $4}' || true
   echo
   restic snapshots --latest 3 --compact
 }
@@ -271,7 +272,10 @@ cmd_status() {
 ask() { # var prompt [default] [secret]
   local var=$1 prompt=$2 def=${3:-} secret=${4:-} val
   if [[ -n ${!var:-} ]]; then return 0; fi
-  [[ $YES == true ]] && die "--yes given but $var is missing (see $NAME --help)"
+  if [[ $YES == true ]]; then
+    [[ -n $def ]] || die "--yes given but $var is missing (see $NAME --help)"
+    printf -v "$var" '%s' "$def"; return 0
+  fi
   if [[ $secret == secret ]]; then
     read -rsp "$prompt: " val; echo
   else
@@ -320,19 +324,31 @@ cmd_init() {
     local prev
     # shellcheck disable=SC1090
     prev=$(source "$CONF" 2>/dev/null; printf '%s\n' "${BACKEND:-}" "${RESTIC_REPOSITORY:-}" "${BACKUP_USERS:-}" "${EXTRA_PATHS:-}" "${PING_URL:-}")
-    { read -r pb; read -r pr; read -r pu; read -r pe; read -r pp; } <<<"$prev"
-    [[ -n $BACKEND ]]   || BACKEND=$pb
-    [[ -n $REPO ]]      || REPO=$pr
-    [[ -n $USERS_OPT ]] || USERS_OPT=$pu
-    [[ -n $EXTRA ]]     || EXTRA=$pe
-    [[ -n $PING ]]      || PING=$pp
+    local pv; mapfile -t pv <<<"$prev"
+    [[ -n $BACKEND ]]   || BACKEND=${pv[0]:-}
+    [[ -n $REPO ]]      || REPO=${pv[1]:-}
+    [[ -n $USERS_OPT ]] || USERS_OPT=${pv[2]:-}
+    [[ -n $EXTRA ]]     || EXTRA=${pv[3]:-}
+    [[ -n $PING ]]      || PING=${pv[4]:-}
     echo "existing config found at $CONF - values shown as defaults"
+  fi
+  if [[ -r $SECRETS ]]; then
+    # keep existing credentials unless new ones were given
+    local ps
+    # shellcheck disable=SC1090
+    ps=$(source "$SECRETS" 2>/dev/null; printf '%s\n' "${RESTIC_REST_USERNAME:-}" "${RESTIC_REST_PASSWORD:-}" "${AWS_ACCESS_KEY_ID:-}" "${AWS_SECRET_ACCESS_KEY:-}" "${AWS_DEFAULT_REGION:-}")
+    local sv; mapfile -t sv <<<"$ps"
+    [[ -n $REST_USER ]]   || REST_USER=${sv[0]:-}
+    [[ -n $REST_PASS ]]   || REST_PASS=${sv[1]:-}
+    [[ -n $S3_KEY ]]      || S3_KEY=${sv[2]:-}
+    [[ -n $S3_SECRET ]]   || S3_SECRET=${sv[3]:-}
+    [[ -n $S3_REGION ]]   || S3_REGION=${sv[4]:-}
   fi
 
   [[ $YES == true || -t 0 ]] || die "stdin is not a terminal; use --yes with options"
   [[ -n $BACKEND ]] || { echo "backend: rest = restic REST server, s3 = S3-compatible object storage"; ask BACKEND "backend (rest/s3)" rest; }
   [[ $BACKEND == rest || $BACKEND == s3 ]] || die "backend must be rest or s3"
-  ask REPO_NAME "repository name (path under your user/bucket)" "$(hostname)"
+  ask REPO_NAME "repository name (path under your user/bucket)" "$(uname -n)"
 
   local secrets_body
   case $BACKEND in

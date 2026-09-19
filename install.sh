@@ -19,12 +19,12 @@ if [[ -z $SRC || ! -x $SRC/bin/$NAME ]]; then
   SRC=$TMP
 fi
 
-install -d -m 0755 "$SHARE" /etc/$NAME
+install -d -m 0755 "$SHARE" /etc/$NAME /etc/systemd/system
 install -m 0755 "$SRC/bin/$NAME" /usr/local/bin/$NAME
 install -m 0644 "$SRC/config/config.example" "$SRC/config/secrets.example" "$SRC/config/excludes.example" "$SHARE/"
 install -m 0644 "$SRC/systemd/$NAME.service" "$SRC/systemd/$NAME.timer" "$SRC/systemd/$NAME-notify.service" /etc/systemd/system/
 restorecon -RF /usr/local/bin/$NAME "$SHARE" /etc/$NAME /etc/systemd/system/$NAME* 2>/dev/null || true
-systemctl daemon-reload
+systemctl daemon-reload 2>/dev/null || echo "warning: systemctl unavailable, skipped daemon-reload"
 
 for t in restic snapper curl; do command -v $t >/dev/null || echo "warning: $t not found in PATH"; done
 echo "installed $NAME $(/usr/local/bin/$NAME version | awk '{print $2}')"
