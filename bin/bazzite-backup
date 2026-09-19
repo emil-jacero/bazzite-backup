@@ -200,7 +200,7 @@ cmd_run() {
 
   cleanup() {
     mountpoint -q "$BIND" && umount "$BIND"
-    [[ -n $SNAP_NUM ]] && snapper -c "$SNAP_CFG" delete "$SNAP_NUM" 2>/dev/null || true
+    if [[ -n $SNAP_NUM ]]; then snapper -c "$SNAP_CFG" delete "$SNAP_NUM" 2>/dev/null || true; fi
     [[ -n $TMP_EXCL ]] && rm -f "$TMP_EXCL"
     return 0
   }

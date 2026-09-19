@@ -10,7 +10,8 @@ NAME=bazzite-backup
 REPO=emil-jacero/$NAME
 REF=${BAZZITE_BACKUP_REF:-main}
 SHARE=/usr/local/share/$NAME
-SRC=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || true)
+SRC=""
+if [[ -n ${BASH_SOURCE[0]:-} ]]; then SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd); fi
 
 if [[ -z $SRC || ! -x $SRC/bin/$NAME ]]; then
   TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
